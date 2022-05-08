@@ -1299,6 +1299,230 @@ class ReferenceField(BaseField):
         return self.document_type._fields.get(member_name)
 
 
+class EmbeddedReferenceField(SaveableBaseField):
+    """A reference to an EmbeddedDocument that will be autoimatically dereferenced on access (lazily).
+    """
+
+    def __init__(self, document_type:str, **kwargs):
+        """Initialises the EmbeddedReferenceField.
+
+        Args:
+            document_type (str): A string formatted where the document type is provided followed by the
+                path to get to the target EmbeddedDocument separated by '.' and using '*' as a wildcard for
+                MapFields. ex: "MyDocument.my_embedded_document.my_map_field.*"
+        """
+        # Extract path information from document_type
+        split = document_type.split(".")
+        self._document_type = get_document(split[0])
+        self._reference_path = split[1:]
+        self._has_wildcards = "*" in self._reference_path
+
+        super().__init__(**kwargs)
+
+    def _get_meta(self, instance):
+        """Used to get a metadata variable attached to the refered instance.
+
+        This is used to store data that cannot be stored using super().__set__(instance, value).
+
+        Args:
+            instance ([type]): The instance of the field.
+
+        Returns:
+            dict: The meta-data dictionary.
+        """
+        if not hasattr(instance, '_meta_data'):
+            instance._meta_data = {
+                "parent": None,
+                "cache": None
+            }
+
+        return instance._meta_data
+
+    def _set_meta(self, instance, value: dict):
+        """Used to set a metadata variable attached to the refered instance.
+
+        This is used to store data that cannot be stored using super().__set__(instance, value).
+
+        Args:
+            instance ([type]): The instance of the field.
+            value (dict): The meta-data you wish to store.
+        """
+        instance._meta_data = value
+
+    def _get_referenced_obj(self, parent, keys=[]):
+        """Get the EmbeddedDocument from the parent that is refered to by this field.
+
+        Using {self._reference_path} and the provided {keys} to fill in the wildcards, transverse the {parent}
+        object to the target EmbeddedDocument.
+
+        Args:
+            parent (Document): The parent Document of the target EmbeddedDocument.
+            keys (list, optional): The keys to use in place of the wildcards of {self._reference_path}. Defaults to [].
+
+        Returns:
+            EmbeddedDocument: The target EmbeddedDocument.
+        """
+        # Start with the parent document
+        cur_obj = parent
+        cur_key_index = 0
+        # Go through the reference path
+        for i in self._reference_path:
+            if i == "*":
+                cur_obj = cur_obj.get(keys[cur_key_index], None)
+                cur_key_index += 1
+            else:
+                cur_obj = getattr(cur_obj, i, None)
+
+        return cur_obj
+
+    def __get__(self, instance, owner):
+        """Descriptor to allow lazy dereferencing."""
+        data = super().__get__(instance, owner)
+        meta = self._get_meta(instance)
+
+        if data is None:
+            return None
+
+        # Make sure the parent has been fetched from the database
+        if meta["parent"] is None:
+            meta["parent"] = self._document_type.objects(pk=data["parent_id"]).first()
+
+        # Make sure that cache is populated
+        if meta["cache"] is None:
+            cur_obj_parent = meta["parent"]
+            meta["cache"] = self._get_referenced_obj(cur_obj_parent, data["key_chain"])
+
+        return meta["cache"]
+
+    def _get_key_chain(self, cur_obj, tar_obj, current_reference_path_index=0, current_key_chain=[]):
+        """Used to determine the wildcards of the {self._reference_path} by recursivly scanning the subobjects.
+
+        Args:
+            cur_obj ([type]): The current object being scanned.
+            tar_obj ([type]): The target object being looked for.
+            current_reference_path_index (int, optional): The current index of {self._reference_path} that we are looking at. Defaults to 0.
+            current_key_chain (list, optional): The current keychain we used to get to this {cur_obj}. Defaults to [].
+
+        Returns:
+            List: The keychain that leads to {tar_obj}
+            None: No path was found that leads to {tar_obj}
+        """
+        # Get the current key we are looking for
+        cur_key = self._reference_path[current_reference_path_index]
+
+        # Base case (last node of reference_path)
+        reference_path_length = len(self._reference_path)
+        if reference_path_length == current_reference_path_index + 1:
+            if cur_key == "*":
+                indexes = [k for (k, v) in cur_obj.items() if v == tar_obj]
+
+                if len(indexes) == 0:
+                    # Object is not found in the expected area
+                    return None
+                else:
+                    return current_key_chain + [indexes[0]]
+
+            else:
+                return current_key_chain
+
+        if cur_key == "*":
+            # Handle wild-card
+            # Go through each key to search for object
+            cur_obj_keys = list(cur_obj.keys())
+            cur_obj_values = cur_obj.values()
+
+            for i in cur_obj_keys:
+                test_key_chain = self._get_key_chain(getattr(cur_obj, i, None), tar_obj,
+                                                     current_reference_path_index + 1, current_key_chain + [i])
+                if test_key_chain is not None:
+                    #  Working keychain was found
+                    return test_key_chain
+
+            # If we get to this point, there was no keychain found in a child's property
+            return None
+
+        else:
+            # handle non-wild-card
+            new_cur_obj = getattr(cur_obj, cur_key, None)
+            return self._get_key_chain(new_cur_obj, tar_obj, current_reference_path_index + 1, current_key_chain)
+
+    def __set__(self, instance, value):
+        """Descriptor for assigning a value to a the EmbeddedReferenceField.
+
+        Args:
+            instance ([type]): [description]
+            value (EmbeddedDocument): The target EmbeddedDocument.
+        """
+        # If value is a dict then we can expect that this is from the DB
+        if type(value) is dict and 'parent_id' in value and 'key_chain' in value:
+            super().__set__(instance, value)
+        else:
+            # Get the parent and pass that onto the underlying ReferenceField
+            parent = getattr(value, "_instance", None)
+
+            if value and parent:
+                # key_chain is a list of wild-card keys needed to find the object
+                if self._has_wildcards:
+                    key_chain = self._get_key_chain(parent, value)
+                else:
+                    key_chain = []
+
+                if key_chain is not None:
+                    # Modify the data
+                    super().__set__(instance, {
+                        "parent_id": parent.id,
+                        "key_chain": key_chain
+                    })
+                    self._set_meta(instance, {
+                        "parent": parent,
+                        "cache": value
+                    })
+                else:
+                    super().__set__(instance, None)
+            else:
+                super().__set__(instance, None)
+
+    def to_python(self, value):
+        """
+        Convert a MongoDB-compatible type to a Python type.
+
+        If there are wildcards store db value as normal,
+        if not only the parent's id is stored
+        """
+        if not self._has_wildcards:
+            value = {
+                "parent_id": value,
+                "key_chain": []
+            }
+        return value
+
+    def to_mongo(self, value):
+        """
+        Convert a Python type to a MongoDB-compatible type.
+
+        If there are wildcards store db value as normal,
+        if not only the parent's id is stored
+        """
+        if not self._has_wildcards:
+            value = value["parent_id"]
+        return value
+    
+    def save(self, instance, **kwargs):
+        # Only save the parent if it has been accessed before
+        if not hasattr(instance, '_meta_data'):
+            meta = self._get_meta(instance)
+            if meta["parent"] is not None:
+                ref = meta["parent"]
+
+                if not ref or isinstance(ref, DBRef):
+                    return
+
+                if not getattr(ref, "_changed_fields", True):
+                    return
+
+                ref.save(**kwargs)
+
+
 class CachedReferenceField(BaseField):
     """A referencefield with cache fields to purpose pseudo-joins"""
 
