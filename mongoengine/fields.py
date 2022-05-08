@@ -74,6 +74,7 @@ __all__ = (
     "DictField",
     "MapField",
     "ReferenceField",
+    "EmbeddedReferenceField",
     "CachedReferenceField",
     "LazyReferenceField",
     "GenericLazyReferenceField",
